@@ -1,0 +1,5 @@
+# Code owners for ivtecture/srs.
+# Каноническая копия. Корневой CODEOWNERS оставлен для совместимости —
+# любое изменение любого из этих файлов блокируется workflow protect-access.
+* @MarkDvoryanchikov
+.github/ @MarkDvoryanchikov

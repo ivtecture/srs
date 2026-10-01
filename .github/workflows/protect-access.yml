@@ -1,0 +1,101 @@
+name: Protect access rights
+
+# Защита репозитория от изменений прав доступа через PR:
+#  - правки CODEOWNERS (в любом из допустимых мест GitHub);
+#  - правки workflow-файлов (могут повысить `permissions:` и обойти защиту);
+#  - смена unix-прав файлов (chmod: mode 100644 <-> 100755).
+#
+# Почему pull_request_target, а не pull_request:
+# workflow выполняется из BASE-ветки (main), а не из кода PR.
+# Поэтому PR, который правит сам этот workflow, не может отключить проверку.
+
+on:
+  pull_request_target:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  guard-access:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch PR head (diff only, no checkout)
+        run: |
+          git fetch --no-tags origin "pull/${{ github.event.pull_request.number }}/head:pr-head"
+
+      - name: Block CODEOWNERS / workflows / chmod changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_ACTOR: ${{ github.event.pull_request.user.login }}
+          # Единственный, кому разрешено менять права доступа.
+          # Должен совпадать с .github/CODEOWNERS и корневым CODEOWNERS.
+          ALLOWED_OWNER: MarkDvoryanchikov
+        run: |
+          set -euo pipefail
+          echo "PR author: $PR_ACTOR"
+          echo "Base: $BASE_SHA"
+
+          if [ "$PR_ACTOR" = "$ALLOWED_OWNER" ]; then
+            echo "Author is codeowner ($ALLOWED_OWNER) — check passes (review by owner still required)."
+            exit 0
+          fi
+
+          CHANGED_FILE=$(mktemp)
+          git diff --name-only "$BASE_SHA"...pr-head -- > "$CHANGED_FILE" || true
+          SUMMARY=$(git diff --summary "$BASE_SHA"...pr-head -- || true)
+
+          echo "--- changed files ---"
+          cat "$CHANGED_FILE"
+          echo "--- diff summary ---"
+          echo "$SUMMARY"
+
+          FAIL=0
+
+          # 1. CODEOWNERS в любом допустимом месте GitHub + любые workflow-файлы.
+          # Читаем построчно через while, чтобы корректно держать пробелы в именах
+          # (например, "SRSTelemedicina (1).md" не должен ломать проверку).
+          while IFS= read -r f || [ -n "$f" ]; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              CODEOWNERS|.github/CODEOWNERS|docs/CODEOWNERS)
+                echo "::error::Запрещено: PR меняет права доступа ($f). Попросите @$ALLOWED_OWNER внести изменение отдельно."
+                FAIL=1
+                ;;
+              .github/workflows/*)
+                echo "::error::Запрещено: PR меняет workflow ($f). Попросите @$ALLOWED_OWNER внести изменение отдельно."
+                FAIL=1
+                ;;
+            esac
+          done < "$CHANGED_FILE"
+
+          # 2. Смена unix-прав (chmod):
+          #  - "mode change 100644 => 100755" — смена прав существующего файла;
+          #  - "create mode 100755" — новый исполняемый файл.
+          if echo "$SUMMARY" | grep -qE 'mode change|create mode 100755'; then
+            echo "::error::Запрещено: PR меняет права доступа к файлам (chmod / mode change):"
+            echo "$SUMMARY" | grep -E 'mode change|create mode 100755' || true
+            echo "Уберите изменения режима файлов (исполняемый бит): оставьте 100644."
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "BLOCKED: обнаружены изменения прав доступа."
+            exit 1
+          fi
+
+          echo "OK: изменений прав доступа нет."
